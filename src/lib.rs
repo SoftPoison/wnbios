@@ -15,14 +15,14 @@ pub type VirtualAddr = *mut c_void;
 
 pub type Result<T> = windows::core::Result<T>;
 
-pub type NtQuerySystemInformation = fn(
+pub type NtQuerySystemInformation = unsafe fn(
     SystemInformationClass: u32,
     SystemInformation: *mut c_void,
     SystemInformationLength: u32,
     ReturnLength: *mut u32,
 ) -> NTSTATUS;
 
-pub type DeviceIoControl = fn(
+pub type DeviceIoControl = unsafe fn(
     device: HANDLE,
     ioctl_code: u32,
     input: *const c_void,
