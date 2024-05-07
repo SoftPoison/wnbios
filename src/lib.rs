@@ -1,6 +1,6 @@
 use std::{
     ffi::c_void,
-    mem::size_of,
+    mem::{size_of, size_of_val},
     ptr::{addr_of, addr_of_mut, null_mut},
 };
 
@@ -54,12 +54,16 @@ struct SystemHandleTableEntryInfoEx {
 }
 
 #[derive(Clone, Copy)]
+struct TableEntry(u64);
+
+/// Windows-version-dependent offsets into the EPROCESS struct
+/// Check <https://www.vergiliusproject.com/kernels/x64/Windows%2011/23H2%20(2023%20Update)/_EPROCESS> for the ones you want
+#[derive(Clone, Copy)]
 pub struct EprocessOffsets {
     pub active_process_link: usize,
     pub virtual_size: usize,
-    pub image_file_name: usize,
     pub unique_process_id: usize,
-    pub section_base_address: usize,
+    pub directory_table: usize,
 }
 
 pub struct WnBios {
@@ -71,14 +75,9 @@ pub struct WnBios {
     ioctl: DeviceIoControl,
 }
 
-pub struct Process<'a> {
-    wnbios: &'a WnBios,
-    cr3: PhysicalAddr,
-    eprocess: VirtualAddr,
-}
-
 impl WnBios {
     /// Creates a new wrapper around the WnBios driver.
+    /// This takes function pointers for [`NtQuerySystemInformation`] and [`DeviceIoControl`] functions so that you can do fun syscall stuff if you want to.
     ///
     /// # Errors
     ///
@@ -127,7 +126,9 @@ impl WnBios {
     ) -> Result<()> {
         let mem = self.map_physical(addr, size)?;
         std::ptr::copy(mem.out_ptr as _, output, size);
-        self.unmap_physical(mem)
+        self.unmap_physical(mem)?;
+
+        Ok(())
     }
 
     /// Reads some memory as a given type from the given physical address.
@@ -181,7 +182,7 @@ impl WnBios {
         self.write_physical_bytes(addr, data as *const T as _, size_of::<T>())
     }
 
-    /// Reads some bytes from the given virtual address.
+    /// Reads some bytes from the given virtual address, taking care across page boundaries.
     ///
     /// # Errors
     ///
@@ -197,10 +198,31 @@ impl WnBios {
         output: *mut u8,
         size: usize,
     ) -> Result<()> {
-        self.read_physical_bytes(self.virtual_to_physical(self.cr3, addr)?, output, size)
+        let mut current_addr = addr;
+        let mut current_output = output;
+        let mut remaining = size;
+
+        while remaining > 0 {
+            let to_read = remaining.min(0x1000 - (current_addr as usize & 0xfff));
+
+            #[cfg(debug_assertions)]
+            println!("[WnBios::read_virtual_bytes] Reading 0x{to_read:x} from {current_addr:?} to {current_output:?}");
+
+            self.read_physical_bytes(
+                self.virtual_to_physical(self.cr3, current_addr)?,
+                current_output,
+                to_read,
+            )?;
+
+            current_addr = current_addr.add(to_read);
+            current_output = current_output.add(to_read);
+            remaining -= to_read;
+        }
+
+        Ok(())
     }
 
-    /// Reads some memory as a given type from the given virtual address.
+    /// Reads some memory as a given type from the given virtual address, taking care across page boundaries.
     ///
     /// # Errors
     ///
@@ -211,10 +233,12 @@ impl WnBios {
     /// This is all unsafe as hell man.
     #[inline]
     pub unsafe fn read_virtual<T>(&self, addr: VirtualAddr) -> Result<T> {
-        self.read_physical(self.virtual_to_physical(self.cr3, addr)?)
+        let mut output: T = std::mem::zeroed();
+        self.read_virtual_bytes(addr, addr_of_mut!(output) as _, size_of::<T>())?;
+        Ok(output)
     }
 
-    /// Writes some bytes to the given virtual address.
+    /// Writes some bytes to the given virtual address, taking care across page boundaries.
     ///
     /// # Errors
     ///
@@ -230,10 +254,30 @@ impl WnBios {
         data: *const u8,
         size: usize,
     ) -> Result<()> {
-        self.write_physical_bytes(self.virtual_to_physical(self.cr3, addr)?, data, size)
+        let mut current_addr = addr;
+        let mut current_input = data;
+        let mut remaining = size;
+
+        while remaining > 0 {
+            let to_write = remaining.min(0x1000 - (current_addr as usize & 0xfff));
+
+            #[cfg(debug_assertions)]
+            println!("[WnBios::write_virtual_bytes] Writing 0x{to_write:x} bytes to {current_addr:?} from {current_input:?}");
+
+            self.write_physical_bytes(
+                self.virtual_to_physical(self.cr3, current_addr)?,
+                current_input,
+                to_write,
+            )?;
+            current_addr = current_addr.add(to_write);
+            current_input = current_input.add(to_write);
+            remaining -= to_write;
+        }
+
+        Ok(())
     }
 
-    /// Writes some memory as a given type to the given virtual address.
+    /// Writes some memory as a given type to the given virtual address, taking care across page boundaries.
     ///
     /// # Errors
     ///
@@ -244,7 +288,7 @@ impl WnBios {
     /// This is all unsafe as hell man.
     #[inline]
     pub unsafe fn write_virtual<T>(&self, addr: VirtualAddr, data: &T) -> Result<()> {
-        self.write_physical(self.virtual_to_physical(self.cr3, addr)?, data)
+        self.write_virtual_bytes(addr, data as *const T as _, size_of::<T>())
     }
 
     /// Finds and opens the process with the given process ID.
@@ -284,7 +328,7 @@ impl WnBios {
 
             if process_id == (pid as u32) {
                 let cr3: PhysicalAddr =
-                    self.read_virtual(eprocess.add(self.offsets.section_base_address))?;
+                    self.read_virtual(eprocess.add(self.offsets.directory_table))?;
 
                 return Ok(Process {
                     wnbios: self,
@@ -297,6 +341,16 @@ impl WnBios {
         Err(STATUS_NOT_FOUND.to_hresult().into())
     }
 
+    /// Uses the WnBios driver to map the given physical memory to a virtual address that's available to the current process.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the driver cannot be contacted or the address it returns is null.
+    /// This could also cause an error if the memory cannot be mapped.
+    ///
+    /// # Safety
+    ///
+    /// This is all unsafe as hell man.
     unsafe fn map_physical(&self, addr: PhysicalAddr, size: usize) -> Result<WnBiosMem> {
         const IOCTL_MAP: u32 = 0x80102040;
         const MEM_SIZE: u32 = size_of::<WnBiosMem>() as _;
@@ -325,6 +379,16 @@ impl WnBios {
         Ok(mem)
     }
 
+    /// Unmaps the physical memory.
+    /// Remember to call this when you're done with accessing the memory!
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the driver cannot be contacted.
+    ///
+    /// # Safety
+    ///
+    /// This is all unsafe as hell man.
     unsafe fn unmap_physical(&self, mem: WnBiosMem) -> Result<()> {
         const IOCTL_UNMAP: u32 = 0x80102044;
         const MEM_SIZE: u32 = size_of::<WnBiosMem>() as _;
@@ -342,28 +406,43 @@ impl WnBios {
         .ok()
     }
 
+    /// Leaks the CR3 value for the kernel.
+    ///
+    /// This uses the "low stub" technique, which searches for the DOS "low stub" in the low regions of physical memory.
+    /// The "low stub" follows a general format, which the code below searches for.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the driver cannot be contacted or the system CR3 cannot be found.
+    ///
+    /// # Safety
+    ///
+    /// This is all unsafe as hell man.
     unsafe fn get_system_cr3(&self) -> Result<PhysicalAddr> {
         for i in 0..10 {
             let mem: WnBiosMem = self.map_physical(i * 0x10_000, 0x10_000)?;
             let buffer = mem.out_ptr;
 
             for offset in (0..0x10_000).step_by(0x1_000) {
-                if 0x00000001000600E9 ^ (0xffffffffffff00ff & *buffer.add(offset).cast::<u64>())
-                    != 0
+                // check if KPROCESSOR_START_BLOCK starts with a JMP instruction to the end of the block (e9), and that KPROCESSOR_START_BLOCK->CompletionFlag == 1
+                if (*buffer.add(offset).cast::<u64>() & 0xffff_ffff_ffff_00ff)
+                    != 0x0000_0001_0006_00e9
                 {
                     continue;
                 }
 
-                if 0xfffff80000000000
-                    ^ (0xfffff80000000000 & *buffer.add(offset + 0x70).cast::<u64>())
-                    != 0
+                // check if KPROCESSOR_START_BLOCK->LmFlag looks sane
+                if (*buffer.add(offset + 0x70).cast::<u64>() & 0xffff_f800_0000_0003)
+                    != 0xffff_f800_0000_0000
                 {
                     continue;
                 }
 
+                // read KPROCESSOR_START_BLOCK->KSPECIAL_REGISTERS->CR3 to get the physical address where the PML4 resides
                 let addr = *buffer.add(offset + 0xa0).cast::<u64>();
 
-                if 0xffffff0000000fff & addr != 0 {
+                // does it look somewhat sane?
+                if addr & 0xffff_ff00_0000_0fff != 0 {
                     continue;
                 }
 
@@ -376,12 +455,23 @@ impl WnBios {
         Err(STATUS_NOT_FOUND.to_hresult().into())
     }
 
+    /// Queries the system extended handle information to leak a pointer to an EPROCESS struct.
+    /// This should be in the system VA space.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the driver cannot be contacted, the system information cannot be queried, or if nothing gets leaked.
+    ///
+    /// # Safety
+    ///
+    /// This is all unsafe as hell man.
     unsafe fn leak_eprocess(&self) -> Result<VirtualAddr> {
         const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 0x40;
-        const SYSTEM_UNIQUE_RESERVED: u32 = 4;
-        const SYSTEM_KPROCESS_HANDLE_ATTRIBUTES: u32 = 0x102A;
-        const SANITY_CHECK: u32 = 3;
+        const SYSTEM_UNIQUE_RESERVED: u32 = 4; // process ID of the system
+        const SYSTEM_KPROCESS_HANDLE_ATTRIBUTES: u32 = 0x102A; // OBJ_DONT_REPARSE|OBJ_EXCLUSIVE|OBJ_NO_RIGHTS_UPGRADE|OBJ_INHERIT
+        const KOBJECTS_PROCESS: u32 = 3;
 
+        // Loop until we actually allocate enough memory for this call
         let mut data = Vec::<u8>::new();
         let mut data_size = 0;
         loop {
@@ -403,19 +493,24 @@ impl WnBios {
             break;
         }
 
+        // The first four bytes are the number of handles
         let number_of_handles = *data.as_ptr().cast::<u32>();
+        // There's four bytes of reserved data after that
+        // Then there are our handle info structs
         let handles = data.as_ptr().add(8).cast::<SystemHandleTableEntryInfoEx>();
 
         for handle in std::slice::from_raw_parts(handles, number_of_handles as _) {
+            // We only want handles owned by the system with the specific attributes
             if handle.unique_process_id != SYSTEM_UNIQUE_RESERVED
                 || handle.handle_attributes != SYSTEM_KPROCESS_HANDLE_ATTRIBUTES
             {
                 continue;
             }
 
-            let check: u32 = self.read_virtual(handle.object)?;
+            let check: u32 = self.read_virtual(handle.object)?; // I think it should really be a u8 comparison here, but eh, it works
 
-            if check == SANITY_CHECK {
+            // Check if the object type is a process
+            if check == KOBJECTS_PROCESS {
                 return Ok(handle.object);
             }
         }
@@ -439,7 +534,6 @@ impl WnBios {
     ///
     /// Now, there are some edge cases.
     /// There's the page size flag, which *I think* indicates that the given page is a huge page, and can be read directly.
-    /// If so, then there's a bug in the below code, because it's checking bit 1<<7, instead of 1<<56.
     ///
     /// ```txt
     /// Control Register 3
@@ -471,66 +565,66 @@ impl WnBios {
     ///                                                             ^^^^ ^^^^^^^^  page offset
     ///
     /// 0bxxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx [PML4 Entry]
-    ///   ^                                                                        region is valid
-    ///    ^                                                                       writes allowed
-    ///     ^                                                                      user mode access allowed
-    ///      ^                                                                     write through
-    ///       ^                                                                    cache disabled
-    ///        ^                                                                   in use/accessed
-    ///         ^                                                                  (unused)
-    ///          ^                                                                 page size (must be 0)
-    ///            ^^^^                                                            (unused)
-    ///                ^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^                    page frame number (CR3 offset to the PDPT)
-    ///                                                         ^^^^               reserved
-    ///                                                             ^^^^ ^^^^^^^   (unused)
-    ///                                                                         ^  execution disabled
+    ///   ^                                                                        execution disabled
+    ///    ^^^^^^^ ^^^^                                                            (unused)
+    ///                ^^^^                                                        reserved
+    ///                     ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^               page frame number (CR3 offset to the PT)
+    ///                                                             ^^^^           (unused)
+    ///                                                                  ^         page size (must be 0)
+    ///                                                                   ^        (unused)
+    ///                                                                    ^       in use/accessed
+    ///                                                                     ^      cache disabled
+    ///                                                                      ^     write through
+    ///                                                                       ^    user mode access allowed
+    ///                                                                        ^   writes allowed
+    ///                                                                         ^  region is valid
     ///
     /// 0bxxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx [PDPT Entry]
-    ///   ^                                                                        region is valid
-    ///    ^                                                                       writes allowed
-    ///     ^                                                                      user mode access allowed
-    ///      ^                                                                     write through
-    ///       ^                                                                    cache disabled
-    ///        ^                                                                   in use/accessed
-    ///         ^                                                                  (unused)
-    ///          ^                                                                 page size (1 = 1GiB)
-    ///            ^^^^                                                            (unused)
-    ///                ^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^                    page frame number (CR3 offset to the PD)
-    ///                                                         ^^^^               reserved
-    ///                                                             ^^^^ ^^^^^^^   (unused)
-    ///                                                                         ^  execution disabled
+    ///   ^                                                                        execution disabled
+    ///    ^^^^^^^ ^^^^                                                            (unused)
+    ///                ^^^^                                                        reserved
+    ///                     ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^               page frame number (CR3 offset to the PT)
+    ///                                                             ^^^^           (unused)
+    ///                                                                  ^         page size (1 = 1GiB)
+    ///                                                                   ^        dirty (page has been written. ignored if page size = 0)
+    ///                                                                    ^       in use/accessed
+    ///                                                                     ^      cache disabled
+    ///                                                                      ^     write through
+    ///                                                                       ^    user mode access allowed
+    ///                                                                        ^   writes allowed
+    ///                                                                         ^  region is valid
     ///
     /// 0bxxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx [PD Entry]
-    ///   ^                                                                        region is valid
-    ///    ^                                                                       writes allowed
-    ///     ^                                                                      user mode access allowed
-    ///      ^                                                                     write through
-    ///       ^                                                                    cache disabled
-    ///        ^                                                                   in use/accessed
-    ///         ^                                                                  (unused)
-    ///          ^                                                                 page size (1 = 2MiB)
-    ///            ^^^^                                                            (unused)
-    ///                ^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^                    page frame number (CR3 offset to the PT)
-    ///                                                         ^^^^               reserved
-    ///                                                             ^^^^ ^^^^^^^   (unused)
-    ///                                                                         ^  execution disabled
+    ///   ^                                                                        execution disabled
+    ///    ^^^^^^^ ^^^^                                                            (unused)
+    ///                ^^^^                                                        reserved
+    ///                     ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^               page frame number (CR3 offset to the PT)
+    ///                                                             ^^^^           (unused)
+    ///                                                                  ^         page size (1 = 2MiB)
+    ///                                                                   ^        dirty (page has been written. ignored if page size = 0)
+    ///                                                                    ^       in use/accessed
+    ///                                                                     ^      cache disabled
+    ///                                                                      ^     write through
+    ///                                                                       ^    user mode access allowed
+    ///                                                                        ^   writes allowed
+    ///                                                                         ^  region is valid
     ///
     /// 0bxxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx_xxxxxxxx [PT Entry]
-    ///   ^                                                                        region is valid
-    ///    ^                                                                       writes allowed
-    ///     ^                                                                      user mode access allowed
-    ///      ^                                                                     write through
-    ///       ^                                                                    cache disabled
-    ///        ^                                                                   in use/accessed
-    ///         ^                                                                  dirty (page has been written)
-    ///          ^                                                                 page access type
-    ///            ^                                                               translations are global
-    ///             ^^^                                                            (unused)
-    ///                ^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^                    page frame number (CR3 offset to the physical page)
-    ///                                                         ^^^^               reserved
-    ///                                                             ^^^^ ^^^       (unused)
-    ///                                                                     ^^^^   protection key
-    ///                                                                         ^  execution disabled
+    ///   ^                                                                        execution disabled
+    ///    ^^^^                                                                    protection key
+    ///        ^^^ ^^^^                                                            (unused)
+    ///                ^^^^                                                        reserved
+    ///                     ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^^^^^ ^^^^               page frame number (CR3 offset to the physical page)
+    ///                                                             ^^^            (unused)
+    ///                                                                ^           translations are global
+    ///                                                                  ^         page access type/page attribute table
+    ///                                                                   ^        dirty (page has been written)
+    ///                                                                    ^       in use/accessed
+    ///                                                                     ^      cache disabled
+    ///                                                                      ^     write through
+    ///                                                                       ^    user mode access allowed
+    ///                                                                        ^   writes allowed
+    ///                                                                         ^  region is valid
     /// ```
     ///
     /// # Errors
@@ -549,50 +643,56 @@ impl WnBios {
 
         let pml4 = (va >> 39) & 0x1ff;
 
-        let pml4e =
-            self.read_physical::<PhysicalAddr>(cr3 + pml4 * std::mem::size_of::<usize>())?;
-        if pml4e == 0 {
+        let pml4e = self.read_physical::<TableEntry>(cr3 + pml4 * std::mem::size_of::<usize>())?;
+        if pml4e.is_invalid() {
             return Err(STATUS_INVALID_ADDRESS.to_hresult().into());
         }
 
         let directory_ptr = (va >> 30) & 0x1ff;
 
-        let pdpte = self.read_physical::<PhysicalAddr>(
-            (pml4e & 0xFFFFFFFFFF000) + directory_ptr * std::mem::size_of::<usize>(),
+        let pdpte = self.read_physical::<TableEntry>(
+            pml4e.page_frame() + directory_ptr * std::mem::size_of::<usize>(),
         )?;
-        if pdpte == 0 {
+
+        if pdpte.is_invalid() {
             return Err(STATUS_INVALID_ADDRESS.to_hresult().into());
         }
 
-        if (pdpte & (1 << 7)) != 0 {
-            return Ok((pdpte & 0xFFFFFC0000000) + (va & 0x3FFFFFFF));
+        if pdpte.large_page() {
+            return Ok((pdpte.0 & 0xFFFFFC0000000) as PhysicalAddr + (va & 0x3FFFFFFF));
         }
 
         let directory = (va >> 21) & 0x1ff;
 
-        let pde = self.read_physical::<PhysicalAddr>(
-            (pdpte & 0xFFFFFFFFFF000) + directory * std::mem::size_of::<usize>(),
+        let pde = self.read_physical::<TableEntry>(
+            pdpte.page_frame() + directory * std::mem::size_of::<usize>(),
         )?;
-        if pde == 0 {
+
+        if pde.is_invalid() {
             return Err(STATUS_INVALID_ADDRESS.to_hresult().into());
         }
 
-        if (pde & (1 << 7)) != 0 {
-            return Ok((pde & 0xFFFFFFFE00000) + (va & 0x1FFFFF));
+        if pde.large_page() {
+            return Ok((pde.0 & 0xFFFFFFFE00000) as PhysicalAddr + (va & 0x1FFFFF));
         }
 
         let table = (va >> 12) & 0x1ff;
 
-        let pte = self.read_physical::<PhysicalAddr>(
-            (pde & 0xFFFFFFFFFF000) + table * std::mem::size_of::<usize>(),
-        )?;
+        let pte = self
+            .read_physical::<TableEntry>(pde.page_frame() + table * std::mem::size_of::<usize>())?;
 
-        if pte == 0 {
+        if pte.is_invalid() {
             return Err(STATUS_INVALID_ADDRESS.to_hresult().into());
         }
 
-        Ok((pte & 0xFFFFFFFFFF000) + (va & 0xFFF))
+        Ok(pte.page_frame() + (va & 0xFFF))
     }
+}
+
+pub struct Process<'a> {
+    wnbios: &'a WnBios,
+    cr3: PhysicalAddr,
+    eprocess: VirtualAddr,
 }
 
 impl<'a> Process<'a> {
@@ -607,8 +707,27 @@ impl<'a> Process<'a> {
     /// This is all unsafe as hell man.
     #[inline]
     pub unsafe fn read_bytes(&self, addr: VirtualAddr, output: *mut u8, size: usize) -> Result<()> {
-        let phys = self.wnbios.virtual_to_physical(self.cr3, addr)?;
-        self.wnbios.read_physical_bytes(phys, output, size)
+        let mut current_addr = addr;
+        let mut current_output = output;
+        let mut remaining = size;
+
+        while remaining > 0 {
+            let to_read = remaining.min(0x1000 - (current_addr as usize & 0xfff));
+
+            #[cfg(debug_assertions)]
+            println!("[Process::read_bytes] Reading 0x{to_read:x} bytes from {current_addr:?} to {current_output:?}");
+
+            self.wnbios.read_physical_bytes(
+                self.wnbios.virtual_to_physical(self.cr3, current_addr)?,
+                current_output,
+                to_read,
+            )?;
+            current_addr = current_addr.add(to_read);
+            current_output = current_output.add(to_read);
+            remaining -= to_read;
+        }
+
+        Ok(())
     }
 
     /// Reads data as the given type from the given address.
@@ -622,8 +741,9 @@ impl<'a> Process<'a> {
     /// This is all unsafe as hell man.
     #[inline]
     pub unsafe fn read<T>(&self, addr: VirtualAddr) -> Result<T> {
-        let phys = self.wnbios.virtual_to_physical(self.cr3, addr)?;
-        self.wnbios.read_physical(phys)
+        let mut output: T = std::mem::zeroed();
+        self.read_bytes(addr, addr_of_mut!(output) as _, size_of::<T>())?;
+        Ok(output)
     }
 
     /// Writes bytes to the given address.
@@ -642,8 +762,27 @@ impl<'a> Process<'a> {
         data: *const u8,
         size: usize,
     ) -> Result<()> {
-        let phys = self.wnbios.virtual_to_physical(self.cr3, addr)?;
-        self.wnbios.write_physical_bytes(phys, data, size)
+        let mut current_addr = addr;
+        let mut current_input = data;
+        let mut remaining = size;
+
+        while remaining > 0 {
+            let to_write = remaining.min(0x1000 - (current_addr as usize & 0xfff));
+
+            #[cfg(debug_assertions)]
+            println!("[Process::write_bytes] Writing 0x{to_write:x} bytes to {current_addr:?} from {current_input:?}");
+
+            self.wnbios.write_physical_bytes(
+                self.wnbios.virtual_to_physical(self.cr3, current_addr)?,
+                current_input,
+                to_write,
+            )?;
+            current_addr = current_addr.add(to_write);
+            current_input = current_input.add(to_write);
+            remaining -= to_write;
+        }
+
+        Ok(())
     }
 
     /// Writes data as the given type to the given address.
@@ -657,12 +796,371 @@ impl<'a> Process<'a> {
     /// This is all unsafe as hell man.
     #[inline]
     pub unsafe fn write<T>(&self, addr: VirtualAddr, data: &T) -> Result<()> {
-        let phys = self.wnbios.virtual_to_physical(self.cr3, addr)?;
-        self.wnbios.write_physical(phys, data)
+        self.write_bytes(addr, data as *const T as _, size_of::<T>())
     }
 
     #[inline]
     pub const fn get_eprocess_ptr(&self) -> VirtualAddr {
         self.eprocess
+    }
+
+    /// Returns an iterator for this process' memory regions.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if it fails to talk to the driver or if the address is invalid.
+    ///
+    /// # Safety
+    ///
+    /// This is all unsafe as hell man.
+    #[inline]
+    pub fn regions(&self) -> Result<RegionWalker> {
+        unsafe {
+            let pml4: [TableEntry; 512] = self.wnbios.read_physical(self.cr3)?;
+
+            Ok(RegionWalker {
+                process: self,
+                pml4,
+                pdpt: std::mem::zeroed(),
+                pd: std::mem::zeroed(),
+                pt: std::mem::zeroed(),
+                pml4_offset: 0,
+                pdpt_offset: 0,
+                pd_offset: 0,
+                pt_offset: 0,
+            })
+        }
+    }
+}
+
+// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_memory_basic_information
+#[repr(C)]
+#[derive(Debug)]
+pub struct MemoryInformation {
+    pub base_address: *mut c_void,
+    pub region_size: usize,
+    pub readable: bool,
+    pub writeable: bool,
+    pub executable: bool,
+    pub present: bool,
+    pub accessed: bool,
+    pub dirty: bool,
+}
+
+impl Default for MemoryInformation {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[inline]
+const fn physical_to_virtual(pml4o: usize, pdpto: usize, pdo: usize, pto: usize) -> VirtualAddr {
+    (pml4o << 39 | pdpto << 30 | pdo << 21 | pto << 12) as _
+}
+
+pub struct RegionWalker<'a> {
+    process: &'a Process<'a>,
+    pml4: [TableEntry; 512],
+    pdpt: [TableEntry; 512],
+    pd: [TableEntry; 512],
+    pt: [TableEntry; 512],
+    pml4_offset: usize,
+    pdpt_offset: usize,
+    pd_offset: usize,
+    pt_offset: usize,
+}
+
+impl<'a> Iterator for RegionWalker<'a> {
+    type Item = MemoryInformation;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // 256..512 supported but not used. I think it's because the user-accessible pages are listed in the top half
+        if self.pml4_offset >= 256 {
+            return None;
+        }
+
+        // traverse down the PML4 from the stored offset
+        for pml4o in self.pml4_offset..256 {
+            let pml4e = self.pml4[pml4o];
+
+            // check if the entry is valid, otherwise skipping to the next one
+            if pml4e.is_invalid() {
+                self.pdpt_offset = 0;
+                self.pd_offset = 0;
+                self.pt_offset = 0;
+                continue;
+            }
+
+            // todo: proper caching so we don't have to re-read this all the damn time
+            unsafe {
+                self.process.wnbios.read_physical_bytes(
+                    pml4e.page_frame(),
+                    self.pdpt.as_mut_ptr() as _,
+                    size_of_val(&self.pdpt),
+                )
+            }
+            .unwrap();
+
+            // traverse down the PDPT from the stored offset
+            for pdpto in self.pdpt_offset..512 {
+                let pdpte = self.pdpt[pdpto];
+
+                // check if the entry is valid, otherwise skipping to the next one
+                if pdpte.is_invalid() {
+                    self.pd_offset = 0;
+                    self.pt_offset = 0;
+                    continue;
+                }
+
+                // check if it's using 1GiB pages, because if so we don't need to look into the PD or PT
+                if pdpte.large_page() {
+                    let mut num_pages = 1;
+                    for i in (pdpto + 1)..512 {
+                        // if the attributes don't look the same, then it's not one large allocation
+                        if self.pdpt[i].attrs() != pdpte.attrs() {
+                            break;
+                        }
+
+                        // note: this doesn't necessarily mean that the pages are contiguous. we'd have to check the differences in the page frame for that
+
+                        num_pages += 1;
+                    }
+
+                    let base_address = physical_to_virtual(pml4o, pdpto, 0, 0);
+                    let region_size = num_pages << 30;
+
+                    // increment and reset all the offsets
+
+                    self.pml4_offset = pml4o;
+                    self.pdpt_offset = pdpto + num_pages;
+                    self.pd_offset = 0;
+                    self.pt_offset = 0;
+
+                    if self.pdpt_offset >= 512 {
+                        self.pml4_offset += 1;
+                        self.pdpt_offset = 0;
+                    }
+
+                    return Some(MemoryInformation {
+                        base_address,
+                        region_size,
+                        readable: pdpte.um_accessible(),
+                        writeable: pdpte.writeable(),
+                        executable: pdpte.executable() && pml4e.executable(),
+                        present: pdpte.present(),
+                        accessed: pdpte.accessed(),
+                        dirty: pdpte.dirty(),
+                    });
+                }
+
+                // todo: proper caching so we don't have to re-read this all the damn time
+                unsafe {
+                    self.process.wnbios.read_physical_bytes(
+                        pdpte.page_frame(),
+                        self.pd.as_mut_ptr() as _,
+                        size_of_val(&self.pd),
+                    )
+                }
+                .unwrap();
+
+                // traverse down the PD from the stored offset
+                for pdo in self.pd_offset..512 {
+                    let pde = self.pd[pdo];
+
+                    // check if the entry is valid, otherwise skipping to the next one
+                    if pde.is_invalid() {
+                        self.pt_offset = 0;
+                        continue;
+                    }
+
+                    // check if we're using 2MiB pages, because if so we don't need to look into the PT
+                    if pde.large_page() {
+                        let mut num_pages = 1;
+                        for i in (pdo + 1)..512 {
+                            // if the attributes don't look the same, then it's not one large allocation
+                            if self.pd[i].attrs() != pde.attrs() {
+                                break;
+                            }
+
+                            // note: this doesn't necessarily mean that the pages are contiguous. we'd have to check the differences in the page frame for that
+
+                            num_pages += 1;
+                        }
+
+                        let base_address = physical_to_virtual(pml4o, pdpto, pdo, 0);
+                        let region_size = num_pages << 21;
+
+                        // increment and reset all the offsets
+
+                        self.pml4_offset = pml4o;
+                        self.pdpt_offset = pdpto;
+                        self.pd_offset = pdo + num_pages;
+                        self.pt_offset = 0;
+
+                        if self.pd_offset >= 512 {
+                            self.pdpt_offset += 1;
+                            self.pd_offset = 0;
+                        }
+
+                        if self.pdpt_offset >= 512 {
+                            self.pml4_offset += 1;
+                            self.pdpt_offset = 0;
+                        }
+
+                        return Some(MemoryInformation {
+                            base_address,
+                            region_size,
+                            readable: pde.um_accessible(),
+                            writeable: pde.writeable(),
+                            executable: pde.executable()
+                                && pdpte.executable()
+                                && pml4e.executable(),
+                            present: pde.present(),
+                            accessed: pde.accessed(),
+                            dirty: pde.dirty(),
+                        });
+                    }
+
+                    // todo: proper caching so we don't have to re-read this all the damn time
+                    unsafe {
+                        self.process.wnbios.read_physical_bytes(
+                            pde.page_frame(),
+                            self.pt.as_mut_ptr() as _,
+                            size_of_val(&self.pt),
+                        )
+                    }
+                    .unwrap();
+
+                    // traverse down the PT from the stored offset
+                    for pto in self.pt_offset..512 {
+                        let pte = self.pt[pto];
+
+                        // check if the entry is valid, otherwise skipping to the next one
+                        if pte.is_invalid() {
+                            continue;
+                        }
+
+                        let mut num_pages = 1;
+                        for i in (pto + 1)..512 {
+                            // if the attributes don't look the same, then it's not one large allocation
+                            if self.pt[i].attrs() != pte.attrs() {
+                                break;
+                            }
+
+                            // note: this doesn't necessarily mean that the pages are contiguous. we'd have to check the differences in the page frame for that
+
+                            num_pages += 1;
+                        }
+
+                        let base_address = physical_to_virtual(pml4o, pdpto, pdo, pto);
+                        let region_size = num_pages << 12;
+
+                        // increment and reset all the offsets
+
+                        self.pml4_offset = pml4o;
+                        self.pdpt_offset = pdpto;
+                        self.pd_offset = pdo;
+                        self.pt_offset = pto + num_pages;
+
+                        if self.pt_offset >= 512 {
+                            self.pd_offset += 1;
+                            self.pt_offset = 0;
+                        }
+
+                        if self.pd_offset >= 512 {
+                            self.pdpt_offset += 1;
+                            self.pd_offset = 0;
+                        }
+
+                        if self.pdpt_offset >= 512 {
+                            self.pml4_offset += 1;
+                            self.pdpt_offset = 0;
+                        }
+
+                        return Some(MemoryInformation {
+                            base_address,
+                            region_size,
+                            readable: pte.um_accessible(),
+                            writeable: pte.writeable(),
+                            executable: pte.executable()
+                                && pde.executable()
+                                && pdpte.executable()
+                                && pml4e.executable(),
+                            present: pte.present(),
+                            accessed: pte.accessed(),
+                            dirty: pte.dirty(),
+                        });
+                    }
+
+                    // if we got this far, all of the checked PT entries were invalid. reset the PT offset for the next PD loop
+                    self.pt_offset = 0;
+                }
+
+                // if we got this far, all of the checked PD and PT entries were invalid. reset the PD and PT offsets for the next PDPT loop
+                self.pd_offset = 0;
+                self.pt_offset = 0;
+            }
+
+            // if we got this far, all of the checked PDPT, PD, and PT entries were invalid. reset these offsets for the next PML4 loop
+            self.pdpt_offset = 0;
+            self.pd_offset = 0;
+            self.pt_offset = 0;
+        }
+
+        // at this stage we've iterated to the end of the PML4, so we're done
+        None
+    }
+}
+
+impl TableEntry {
+    #[inline]
+    const fn present(&self) -> bool {
+        (self.0 & 1) != 0
+    }
+
+    #[inline]
+    const fn writeable(&self) -> bool {
+        (self.0 & (1 << 1)) != 0
+    }
+
+    #[inline]
+    const fn um_accessible(&self) -> bool {
+        (self.0 & (1 << 2)) != 0
+    }
+
+    #[inline]
+    const fn accessed(&self) -> bool {
+        (self.0 & (1 << 5)) != 0
+    }
+
+    #[inline]
+    const fn dirty(&self) -> bool {
+        (self.0 & (1 << 6)) != 0
+    }
+
+    /// Only valid for PDPT and PD entries
+    #[inline]
+    const fn large_page(&self) -> bool {
+        (self.0 & (1 << 7)) != 0
+    }
+
+    #[inline]
+    const fn page_frame(&self) -> usize {
+        (self.0 & 0xFFFFFFFFFF000) as _
+    }
+
+    #[inline]
+    const fn executable(&self) -> bool {
+        (self.0 & (1 << 63)) == 0
+    }
+
+    #[inline]
+    const fn is_invalid(&self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    const fn attrs(&self) -> u64 {
+        self.0 & (1 << 63 | 0xfff)
     }
 }
